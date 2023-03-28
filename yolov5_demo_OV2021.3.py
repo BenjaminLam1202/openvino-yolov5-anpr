@@ -152,32 +152,27 @@ def resize_(image, scale):
 
 def detect_and_save_car(frame, detection_result, save_dir='car_images/', threshold_distance=100, confidence_threshold=0.5):
     global prev_x, prev_y
-
-    # Extract the bounding box coordinates, confidence level, and class ID from the detection result
+    
+    # Extract the bounding box coordinates and confidence level from the detection result
     xmin, xmax, ymin, ymax = detection_result['xmin'], detection_result['xmax'], detection_result['ymin'], detection_result['ymax']
     confidence = detection_result['confidence']
     class_id = detection_result['class_id']
-
+    
     # Calculate the x and y coordinates of the center of the bounding box
     x, y = (xmin + xmax) // 2, (ymin + ymax) // 2
-
-    # Check if car is detected with confidence above threshold
+    
+    # If car is detected with confidence above threshold
     if confidence > confidence_threshold:
-
-        # Check if previous position of car is not set or the car has moved a distance above threshold_distance
+        # If previous position of car is not set or the car has moved a distance above threshold_distance
         if prev_x is None or prev_y is None or abs(x - prev_x) > threshold_distance or abs(y - prev_y) > threshold_distance:
-
             # Save image with current timestamp
             filename = f"{format_date(detection_result)}" 
             filepath = os.path.join(save_dir, filename)
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             saved_yet = cv2.imwrite(filepath, frame)
             print(f"save {filepath} {saved_yet}")
-
             # Update previous position of car
             prev_x, prev_y = x, y
-
-
 def get_random_string(length):
     # With combination of lower and upper case
     result_str = ''.join(random.choice(string.ascii_letters) for i in range(length))
@@ -340,7 +335,7 @@ def is_near_center(obj, screen_width, screen_height, threshold):
     return distance_x < threshold  * screen_width and distance_y < threshold * screen_height
 
 def process_object(arg):
-    in_frame, obj, pre_list, origin_im_size, labels_map, args, detection_object_list, frame = arg
+    in_frame, obj, pre_list, origin_im_size, labels_map, args, detection_object_list, frame, is_async_mode, det_time, render_time, cur_request_id, parsing_time = arg
 
     curr = obj
     in_frame_shape = in_frame.shape[2:]
@@ -373,6 +368,7 @@ def process_object(arg):
                     (obj['xmin'], obj['ymin'] - 7), cv2.FONT_HERSHEY_COMPLEX, 0.6, color, 1)
 
         if check == False and obj['confidence'] >= 0.70 and check_center == True:
+            saved_plate_path = "/home/min/research/yolov5_demo/runtest/"
             detect_and_save_car(frame, detection_result=obj)
             start_time = time()
 
@@ -443,60 +439,109 @@ def main():
     detection_object_list = args.objects
     # ----------------------------------------------- 6. Doing inference -----------------------------------------------
     log.info("Starting inference...")
-    print("To close the application, press 'CTRL+C' here or switch to the output window and press ESC key")
-    print("To switch between sync/async modes, press TAB key in the output window")
+    frame_counter = 0
+    frame_skip = 10 
     while True:
-        # Capture frame and check for errors
-        ret, frame = cap.read()
+        # Here is the first asynchronous point: in the Async mode, we capture frame to populate the NEXT infer request
+        # in the regular mode, we capture frame to the CURRENT infer request
+        if is_async_mode:
+            ret, next_frame = cap.read()
+        else:
+            ret, frame = cap.read()
+
+        # Increment frame counter
+        frame_counter += 1
+        # Skip every other frame
+        if frame_counter % frame_skip != 0:
+            continue
+
         if not ret:
             continue
-        
-        # Preprocess frame
-        in_frame = letterbox(frame, (w, h))
-        in_frame = in_frame.transpose((2, 0, 1))
+
+        if is_async_mode:
+            request_id = next_request_id
+            in_frame = letterbox(frame, (w, h))
+        else:
+            request_id = cur_request_id
+            in_frame = letterbox(frame, (w, h))
+
+        in_frame0 = in_frame
+        # resize input_frame to network size
+        in_frame = in_frame.transpose((2, 0, 1))  # Change data layout from HWC to CHW
         in_frame = in_frame.reshape((n, c, h, w))
-        
+
         # Start inference
         start_time = time()
-        exec_net.start_async(request_id=cur_request_id, inputs={input_blob: in_frame})
+        exec_net.start_async(request_id=request_id, inputs={input_blob: in_frame})
         det_time = time() - start_time
-        
-        # Collect object detection results
+        # print(in_frame.shape[3])
+        # Collecting object detection results
         objects = list()
         if exec_net.requests[cur_request_id].wait(-1) == 0:
             output = exec_net.requests[cur_request_id].output_blobs
+            start_time = time()
             for layer_name, out_blob in output.items():
                 layer_params = YoloParams(side=out_blob.buffer.shape[2])
-                objects += parse_yolo_region(out_blob.buffer, in_frame.shape[2:], frame.shape[:-1], layer_params, args.prob_threshold)
-        
-        # Filter overlapping boxes
+                # log.info("Layer {} parameters: ".format(layer_name))
+                layer_params.log_params()
+                objects += parse_yolo_region(out_blob.buffer, in_frame.shape[2:],
+                                             #in_frame.shape[2:], layer_params,
+                                             frame.shape[:-1], layer_params,
+                                             args.prob_threshold)
+            parsing_time = time() - start_time
+
+        # Filtering overlapping boxes with respect to the --iou_threshold CLI parameter
         objects = sorted(objects, key=lambda obj : obj['confidence'], reverse=True)
         for i in range(len(objects)):
+            # print(objects[i]['confidence'])
+            
             if objects[i]['confidence'] == 0:
                 continue
             for j in range(i + 1, len(objects)):
                 if intersection_over_union(objects[i], objects[j]) > args.iou_threshold:
                     objects[j]['confidence'] = 0
+
+        # Drawing objects with respect to the --prob_threshold CLI parameter
         objects = [obj for obj in objects if obj['confidence'] >= args.prob_threshold]
 
-        # Initialize trackers and tracker IDs
-        origin_im_size = frame.shape[:-1]
+        if len(objects) and args.raw_output_message:
+            log.info("\nDetected boxes for batch {}:".format(1))
+            log.info(" Class ID | Confidence | XMIN | YMIN | XMAX | YMAX | COLOR ")
 
-        # Process objects in parallel
-        arg_list = [(in_frame, obj, pre_list, origin_im_size, labels_map, args, detection_object_list, frame) for obj in objects]
+        origin_im_size = frame.shape[:-1]
+        # Define a threshold distance for matching detections to trackers
+        threshold_distance = 50
+
+        # Initialize an empty dictionary to store the trackers
+        trackers = {}
+
+        # Initialize an empty list to store the tracker IDs for each bounding box
+        tracker_ids = []
+        arg_list = [(in_frame,
+                    obj,
+                    pre_list,
+                    origin_im_size,
+                    labels_map,
+                    args,
+                    detection_object_list,
+                    frame,
+                    is_async_mode,
+                    det_time,
+                    render_time,
+                    cur_request_id,
+                    parsing_time) for obj in objects]
+        # print(arg_list)
         pool = mp.Pool(processes=10)
         result = pool.map(process_object,arg_list)
         pre_list = objects
 
-        # Show results if desired
-
+        # if args.show:
+        #     # cv2.imshow("DetectionResults", frame)
         cv2.imshow("TonVision", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cv2.destroyAllWindows()
-
-
 
 
 if __name__ == '__main__':
