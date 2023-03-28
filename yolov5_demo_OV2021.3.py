@@ -20,12 +20,16 @@ import logging
 import os
 import sys
 from argparse import ArgumentParser, SUPPRESS
-from math import exp as exp
+from math import exp 
+from math import sqrt
 from time import time
 import numpy as np
 import random
 import string
 import datetime
+import uuid
+import cmath as math
+import multiprocessing as mp
 
 import cv2
 from openvino.inference_engine import IENetwork, IECore
@@ -33,6 +37,49 @@ from openvino.inference_engine import IENetwork, IECore
 logging.basicConfig(format="[ %(levelname)s ] %(message)s", level=logging.INFO, stream=sys.stdout)
 log = logging.getLogger()
 prev_x, prev_y = None, None
+
+
+class CarTracker:
+    def __init__(self, bbox):
+        self.id = uuid.uuid4().hex[:6].upper()  # Generate a unique ID for the tracker
+        self.kf = cv2.KalmanFilter(4, 2)  # Initialize a Kalman filter with 4 state variables and 2 measurement variables
+        self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)  # Set the measurement matrix to extract position information
+        self.kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)  # Set the transition matrix to update position and velocity
+        self.kf.processNoiseCov = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0.01, 0], [0, 0, 0, 0.01]], np.float32)  # Set the process noise covariance matrix to account for measurement noise and acceleration
+        self.kf.statePost = np.array([[bbox['xmin']], [bbox['ymin']], [0], [0]], np.float32)  # Initialize the state vector to the position of the current bbox
+        self.last_detection = time()  # Record the time of the last detection
+
+    def update(self, bbox):
+        measurement = np.array([[bbox['xmin']], [bbox['ymin']]], np.float32)  # Extract the position information from the current bbox
+        self.kf.correct(measurement)  # Update the Kalman filter with the measurement
+        self.last_detection = time()  # Record the time of the last detection
+
+    def predict(self):
+        self.kf.predict()
+        predicted_bbox = {'xmin': int(self.kf.statePost[0, 0]), 'ymin': int(self.kf.statePost[1, 0]), 'xmax': int(self.kf.statePost[0, 0] + (self.kf.statePost[2, 0],  10)), 'ymax': int(self.kf.statePost[1, 0] + (self.kf.statePost[3, 0],  10))}
+        return predicted_bbox
+
+
+
+
+def is_same_object(curr, pre_list, threshold=100):
+    # Calculate the center point of curr
+    curr_center_x = (curr['xmin'] + curr['xmax']) / 2
+    curr_center_y = (curr['ymin'] + curr['ymax']) / 2
+    if pre_list == []:
+        return False
+    # Check if there are any objects in pre_list whose center point is close to curr
+    for pre in pre_list:
+        pre_center_x = (pre['xmin'] + pre['xmax']) / 2
+        pre_center_y = (pre['ymin'] + pre['ymax']) / 2
+        A = (curr_center_x - pre_center_x)**2
+        B = (curr_center_y - pre_center_y)**2
+        cur = A + B
+        distance = sqrt(cur)
+        # print(distance)
+        if distance < threshold:
+            return True
+    return False
 
 def build_argparser():
     parser = ArgumentParser(add_help=False)
@@ -49,7 +96,8 @@ def build_argparser():
                       help="Optional. Specify the target device to infer on; CPU, GPU, FPGA, HDDL or MYRIAD is"
                            " acceptable. The sample will look for a suitable plugin for device specified. "
                            "Default value is CPU", default="CPU", type=str)
-    args.add_argument("--labels", help="Optional. Labels mapping file", default=None, type=str)
+    args.add_argument("--labels", help="Optional. Labels mapping file", default=None, type=list)
+    args.add_argument("-oj","--objects", help="Optional. object", default=[2], type=list)
     args.add_argument("-t", "--prob_threshold", help="Optional. Probability threshold for detections filtering",
                       default=0.5, type=float)
     args.add_argument("-iout", "--iou_threshold", help="Optional. Intersection over union threshold for overlapping "
@@ -60,6 +108,7 @@ def build_argparser():
     args.add_argument("-r", "--raw_output_message", help="Optional. Output inference results raw values showing",
                       default=False, action="store_true")
     args.add_argument("--no_show", help="Optional. Don't show output", action='store_true')
+    args.add_argument("--show", help="Optional. Don't show output",action='store_true')
     return parser
 
 
@@ -92,7 +141,14 @@ class YoloParams:
         params_to_print = {'classes': self.classes, 'num': self.num, 'coords': self.coords, 'anchors': self.anchors}
         # [log.info("         {:8}: {}".format(param_name, param)) for param_name, param in params_to_print.items()]
 
-
+def resize_(image, scale):
+    """
+    Compress cv2 resize function
+    """
+    width = int(image.shape[1] * scale)
+    height = int(image.shape[0] * scale)
+    dsize = (width, height)
+    return cv2.resize(image, dsize,interpolation=cv2.INTER_AREA)
 
 def detect_and_save_car(frame, detection_result, save_dir='car_images/', threshold_distance=100, confidence_threshold=0.5):
     global prev_x, prev_y
@@ -100,6 +156,7 @@ def detect_and_save_car(frame, detection_result, save_dir='car_images/', thresho
     # Extract the bounding box coordinates and confidence level from the detection result
     xmin, xmax, ymin, ymax = detection_result['xmin'], detection_result['xmax'], detection_result['ymin'], detection_result['ymax']
     confidence = detection_result['confidence']
+    class_id = detection_result['class_id']
     
     # Calculate the x and y coordinates of the center of the bounding box
     x, y = (xmin + xmax) // 2, (ymin + ymax) // 2
@@ -109,7 +166,7 @@ def detect_and_save_car(frame, detection_result, save_dir='car_images/', thresho
         # If previous position of car is not set or the car has moved a distance above threshold_distance
         if prev_x is None or prev_y is None or abs(x - prev_x) > threshold_distance or abs(y - prev_y) > threshold_distance:
             # Save image with current timestamp
-            filename = format_date() 
+            filename = f"{format_date(detection_result)}" 
             filepath = os.path.join(save_dir, filename)
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             saved_yet = cv2.imwrite(filepath, frame)
@@ -122,10 +179,10 @@ def get_random_string(length):
     # print random string
     return result_str
 
-def format_date():
+def format_date(detection_result):
     now = datetime.datetime.now()
     date_str = now.strftime("%Y/%m/%d/%H")
-    file_str = now.strftime(f"%y%m%d%H%M%S_{get_random_string(7)}.jpg")
+    file_str = now.strftime(f"%y_%m_%d_%H_%M_%S_{detection_result['class_id']}_{int(float(detection_result['confidence'])*100)}.jpg")
     return f"{date_str}/{file_str}"
 
 def save_image_with_date_format(image, directory):
@@ -263,6 +320,57 @@ def intersection_over_union(box_1, box_2):
         return 0
     return area_of_overlap / area_of_union
 
+# Define a function to generate a unique ID for each car
+def generate_car_id(bbox):
+    xmin, ymin, xmax, ymax = bbox
+    return str(xmin) + "_" + str(ymin) + "_" + str(xmax) + "_" + str(ymax)
+
+def is_near_center(obj, screen_width, screen_height, threshold):
+    center_x = screen_width / 2
+    center_y = screen_height / 2
+    box_center_x = (obj['xmin'] + obj['xmax']) / 2
+    box_center_y = (obj['ymin'] + obj['ymax']) / 2
+    distance_x = abs(box_center_x - center_x)
+    distance_y = abs(box_center_y - center_y)
+    return distance_x < threshold  * screen_width and distance_y < threshold * screen_height
+
+def process_object(arg):
+    in_frame, obj, pre_list, origin_im_size, labels_map, args, detection_object_list, frame, is_async_mode, det_time, render_time, cur_request_id, parsing_time = arg
+
+    curr = obj
+    in_frame_shape = in_frame.shape[2:]
+    check = is_same_object(curr, pre_list, threshold=100)
+    check_center = is_near_center(curr, in_frame_shape[0], in_frame_shape[1], 100)
+
+    # Validation bbox of detected object
+    valid_box = np.logical_and.reduce((
+        np.greater_equal(obj['xmin'], 0),
+        np.less(obj['xmin'], obj['xmax']),
+        np.less(obj['xmax'], origin_im_size[1]),
+        np.greater_equal(obj['ymin'], 0),
+        np.less(obj['ymin'], obj['ymax']),
+        np.less(obj['ymax'], origin_im_size[0])
+    ))
+    if not valid_box:
+        return
+
+    color = (min(int(obj['class_id'] * 12.5), 255), min(obj['class_id'] * 7, 255), min(obj['class_id'] * 5, 255))
+    det_label = labels_map[obj['class_id']] if labels_map and len(labels_map) >= obj['class_id'] else str(obj['class_id'])
+
+    log_message = "{:^9} | {:^10f} | {:^4} | {:^4} | {:^4} | {:^4} | {}".format(
+        det_label, obj['confidence'], obj['xmin'], obj['ymin'], obj['xmax'], obj['ymax'], color)
+    if args.raw_output_message:
+        log.info(log_message)
+    
+    if obj['class_id'] in detection_object_list:
+        cv2.rectangle(frame, (obj['xmin'], obj['ymin']), (obj['xmax'], obj['ymax']), color, 2)
+        cv2.putText(frame, "#" + det_label + ' ' + str(round(obj['confidence'] * 100, 1)) + ' %',
+                    (obj['xmin'], obj['ymin'] - 7), cv2.FONT_HERSHEY_COMPLEX, 0.6, color, 1)
+
+        if check == False and obj['confidence'] >= 0.70 and check_center == True:
+            saved_plate_path = "/home/min/research/yolov5_demo/runtest/"
+            detect_and_save_car(frame, detection_result=obj)
+            start_time = time()
 
 
 def main():
@@ -279,17 +387,6 @@ def main():
     model = args.model
     log.info(f"Loading network:\n\t{model}")
     net = ie.read_network(model=model)
-
-    # ---------------------------------- 3. Load CPU extension for support specific layer ------------------------------
-#    if "CPU" in args.device:
-#        supported_layers = ie.query_network(net, "CPU")
-#        not_supported_layers = [l for l in net.layers.keys() if l not in supported_layers]
-#        if len(not_supported_layers) != 0:
-#            log.error("Following layers are not supported by the plugin for specified device {}:\n {}".
-#                     format(args.device, ', '.join(not_supported_layers)))
-#            log.error("Please try to specify cpu extensions library path in sample's command line parameters using -l "
-#                      "or --cpu_extension command line argument")
-#            sys.exit(1)
 
     assert len(net.input_info.keys()) == 1, "Sample supports only YOLO V3 based single input topologies"
 
@@ -334,6 +431,12 @@ def main():
     render_time = 0
     parsing_time = 0
 
+    # Define a maximum distance threshold
+    max_distance = 10  # adjust this value based on your use case
+    pre_list = []
+    # Initialize the list of previous object IDs and their corresponding center points or bounding boxes
+    prev_objects = []
+    detection_object_list = args.objects
     # ----------------------------------------------- 6. Doing inference -----------------------------------------------
     log.info("Starting inference...")
     print("To close the application, press 'CTRL+C' here or switch to the output window and press ESC key")
@@ -347,7 +450,7 @@ def main():
             ret, frame = cap.read()
 
         if not ret:
-            break
+            continue
 
         if is_async_mode:
             request_id = next_request_id
@@ -365,7 +468,7 @@ def main():
         start_time = time()
         exec_net.start_async(request_id=request_id, inputs={input_blob: in_frame})
         det_time = time() - start_time
-
+        # print(in_frame.shape[3])
         # Collecting object detection results
         objects = list()
         if exec_net.requests[cur_request_id].wait(-1) == 0:
@@ -400,68 +503,37 @@ def main():
             log.info(" Class ID | Confidence | XMIN | YMIN | XMAX | YMAX | COLOR ")
 
         origin_im_size = frame.shape[:-1]
-        
-        for obj in objects:
-            # print(obj)
-            # Validation bbox of detected object
-            if obj['xmax'] > origin_im_size[1] or obj['ymax'] > origin_im_size[0] or obj['xmin'] < 0 or obj['ymin'] < 0:
-                continue
-            color = (int(min(obj['class_id'] * 12.5, 255)),
-                     min(obj['class_id'] * 7, 255), min(obj['class_id'] * 5, 255))
-            det_label = labels_map[obj['class_id']] if labels_map and len(labels_map) >= obj['class_id'] else \
-                str(obj['class_id'])
+        # Define a threshold distance for matching detections to trackers
+        threshold_distance = 50
 
-            if args.raw_output_message:
-                log.info(
-                    "{:^9} | {:10f} | {:4} | {:4} | {:4} | {:4} | {} ".format(det_label, obj['confidence'], obj['xmin'],
-                                                                              obj['ymin'], obj['xmax'], obj['ymax'],
-                                                                              color))
+        # Initialize an empty dictionary to store the trackers
+        trackers = {}
 
-            cv2.rectangle(frame, (obj['xmin'], obj['ymin']), (obj['xmax'], obj['ymax']), color, 2)
-            cv2.putText(frame,
-                        "#" + det_label + ' ' + str(round(obj['confidence'] * 100, 1)) + ' %',
-                        (obj['xmin'], obj['ymin'] - 7), cv2.FONT_HERSHEY_COMPLEX, 0.6, color, 1)
-            if obj['class_id'] == 3 and obj['confidence'] >= 0.50:
-                saved_plate_path = "/home/min/research/yolov5_demo/runtest/"
-                # saved_filepath = save_image_with_date_format(frame, saved_plate_path)
-                detect_and_save_car(frame,detection_result = obj)
-                # print(saved_filepath)
-                # print("car")
+        # Initialize an empty list to store the tracker IDs for each bounding box
+        tracker_ids = []
+        arg_list = [(in_frame,
+                    obj,
+                    pre_list,
+                    origin_im_size,
+                    labels_map,
+                    args,
+                    detection_object_list,
+                    frame,
+                    is_async_mode,
+                    det_time,
+                    render_time,
+                    cur_request_id,
+                    parsing_time) for obj in objects]
+        # print(arg_list)
+        pool = mp.Pool(processes=10)
+        result = pool.map(process_object,arg_list)
+        pre_list = objects
 
-        # Draw performance stats over frame
-        inf_time_message = "Inference time: N\A for async mode" if is_async_mode else \
-            "Inference time: {:.3f} ms".format(det_time * 1e3)
-        render_time_message = "OpenCV rendering time: {:.3f} ms".format(render_time * 1e3)
-        async_mode_message = "Async mode is on. Processing request {}".format(cur_request_id) if is_async_mode else \
-            "Async mode is off. Processing request {}".format(cur_request_id)
-        parsing_message = "YOLO parsing time is {:.3f} ms".format(parsing_time * 1e3)
-
-        cv2.putText(frame, inf_time_message, (15, 15), cv2.FONT_HERSHEY_COMPLEX, 0.5, (200, 10, 10), 1)
-        cv2.putText(frame, render_time_message, (15, 45), cv2.FONT_HERSHEY_COMPLEX, 0.5, (10, 10, 200), 1)
-        cv2.putText(frame, async_mode_message, (10, int(origin_im_size[0] - 20)), cv2.FONT_HERSHEY_COMPLEX, 0.5,
-                    (10, 10, 200), 1)
-        cv2.putText(frame, parsing_message, (15, 30), cv2.FONT_HERSHEY_COMPLEX, 0.5, (10, 10, 200), 1)
-
-        start_time = time()
-        # if not args.no_show:
-        #     cv2.imshow("DetectionResults", frame)
-        # render_time = time() - start_time
-
-        # if is_async_mode:
-        #     cur_request_id, next_request_id = next_request_id, cur_request_id
-        #     frame = next_frame
-
-        # if not args.no_show:
-        #     key = cv2.waitKey(wait_key_code)
-    
-        #     # ESC key
-        #     if key == 27:
+        # if args.show:
+        #     # cv2.imshow("DetectionResults", frame)
+        #     cv2.imshow("TonVision", frame)
+        #     if cv2.waitKey(1) & 0xFF == ord('q'):
         #         break
-        #     # Tab key
-        #     if key == 9:
-        #         exec_net.requests[cur_request_id].wait()
-        #         is_async_mode = not is_async_mode
-        #         log.info("Switched to {} mode".format("async" if is_async_mode else "sync"))
 
     cv2.destroyAllWindows()
 
