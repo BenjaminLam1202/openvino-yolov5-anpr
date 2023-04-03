@@ -96,6 +96,10 @@ def build_argparser():
                       help="Optional. Specify the target device to infer on; CPU, GPU, FPGA, HDDL or MYRIAD is"
                            " acceptable. The sample will look for a suitable plugin for device specified. "
                            "Default value is CPU", default="CPU", type=str)
+    args.add_argument("-id", "--device_id",
+                      help="device id", default="unknown", type=str)
+    args.add_argument("-s", "--save_dir",
+                      help="location save images", default="images/", type=str)
     args.add_argument("--labels", help="Optional. Labels mapping file", default=None, type=list)
     args.add_argument("-oj","--objects", help="Optional. object", default=[2], type=list)
     args.add_argument("-t", "--prob_threshold", help="Optional. Probability threshold for detections filtering",
@@ -150,7 +154,7 @@ def resize_(image, scale):
     dsize = (width, height)
     return cv2.resize(image, dsize,interpolation=cv2.INTER_AREA)
 
-def detect_and_save_car(frame, detection_result, save_dir='car_images/', threshold_distance=100, confidence_threshold=0.5):
+def detect_and_save_car(frame,args, detection_result, threshold_distance=100, confidence_threshold=0.5):
     global prev_x, prev_y
     
     # Extract the bounding box coordinates and confidence level from the detection result
@@ -167,7 +171,7 @@ def detect_and_save_car(frame, detection_result, save_dir='car_images/', thresho
         if prev_x is None or prev_y is None or abs(x - prev_x) > threshold_distance or abs(y - prev_y) > threshold_distance:
             # Save image with current timestamp
             filename = f"{format_date(detection_result)}" 
-            filepath = os.path.join(save_dir, filename)
+            filepath = os.path.join(args.save_dir, filename)
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             saved_yet = cv2.imwrite(filepath, frame)
             print(f"save {filepath} {saved_yet}")
@@ -369,7 +373,7 @@ def process_object(arg):
 
         if check == False and obj['confidence'] >= 0.70 and check_center == True:
             saved_plate_path = "/home/min/research/yolov5_demo/runtest/"
-            detect_and_save_car(frame, detection_result=obj)
+            detect_and_save_car(frame,args,detection_result=obj)
             start_time = time()
 
 
@@ -537,9 +541,9 @@ def main():
 
         # if args.show:
         #     # cv2.imshow("DetectionResults", frame)
-        cv2.imshow("TonVision", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        # cv2.imshow("TonVision", frame)
+        # if cv2.waitKey(1) & 0xFF == ord('q'):
+        #     break
 
     cv2.destroyAllWindows()
 
